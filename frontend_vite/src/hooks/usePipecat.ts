@@ -37,9 +37,17 @@ export function usePipecat() {
 
             const transport = new SmallWebRTCTransport()
 
-            // Handle incoming audio tracks
+            // Handle incoming audio tracks (bot only — never local mic)
             const audioEl = new Audio()
             audioEl.autoplay = true
+
+            // Grab the local mic stream so we can exclude its tracks from playback
+            let localStream: MediaStream | null = null
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+            } catch {
+                // If we can't get the local stream reference, fall back to track.label heuristic
+            }
 
             const client = new PipecatClient({
                 transport,
@@ -47,12 +55,19 @@ export function usePipecat() {
                 enableCam: false,
                 callbacks: {
                     // ── Media ────────────────────────────────────────────────────
-                    onTrackStarted: (track: MediaStreamTrack) => {
-                        if (track.kind === 'audio') {
-                            const stream = new MediaStream([track])
-                            audioEl.srcObject = stream
-                            audioEl.play().catch(console.error)
-                        }
+                    onTrackStarted: (track: MediaStreamTrack, participant?: { local?: boolean }) => {
+                        if (track.kind !== 'audio') return
+
+                        // Skip local mic tracks — only play remote (bot) audio
+                        const isLocal =
+                            participant?.local === true ||
+                            (localStream?.getTracks().some(t => t.id === track.id) ?? false)
+
+                        if (isLocal) return
+
+                        const stream = new MediaStream([track])
+                        audioEl.srcObject = stream
+                        audioEl.play().catch(console.error)
                     },
 
                     // ── Connection ───────────────────────────────────────────────
@@ -74,6 +89,9 @@ export function usePipecat() {
                         // Stop audio
                         audioEl.pause()
                         audioEl.srcObject = null
+                        // Release local stream reference to free mic
+                        localStream?.getTracks().forEach(t => t.stop())
+                        localStream = null
                     },
 
                     // ── VAD ──────────────────────────────────────────────────────

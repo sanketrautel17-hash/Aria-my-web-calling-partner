@@ -10,8 +10,9 @@ Endpoints:
 
 import asyncio
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List
 
@@ -24,6 +25,7 @@ from pipecat.transports.smallwebrtc.request_handler import (
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 
 from core.pipeline import create_pipeline
+from core.recordings import get_recordings_dir, list_recordings
 from commons.logger import logger
 
 log = logger(__name__)
@@ -238,3 +240,29 @@ async def shutdown():
     """Clean up all active WebRTC connections on server shutdown."""
     log.info("Server shutting down — closing all WebRTC connections")
     await _handler.close()
+
+
+# ── Recordings ────────────────────────────────────────────────────────────────
+@app.get("/api/recordings", tags=["Recordings"])
+async def get_recordings():
+    """Return a list of all saved call recordings with metadata."""
+    return {"recordings": list_recordings()}
+
+
+@app.get("/api/recordings/{filename}", tags=["Recordings"])
+async def download_recording(filename: str):
+    """Stream a specific WAV recording by filename."""
+    # Sanitize — no path traversal
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    filepath = get_recordings_dir() / filename
+    if not filepath.exists() or not filepath.is_file():
+        raise HTTPException(status_code=404, detail="Recording not found")
+
+    return FileResponse(
+        path=str(filepath),
+        media_type="audio/wav",
+        filename=filename,
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
