@@ -1,31 +1,31 @@
 """
-Pipecat pipeline factory (v0.0.102-compatible).
+Aria — Unified Pipecat pipeline factory.
 
-Pipeline:
-  SmallWebRTCTransport.input()
-    → AudioBufferProcessor (capture user audio, left channel)
-    → DeepgramSTTService
-    → LLMContextAggregator (user)
-    → GroqLLMService
-    → DeepgramTTSService
-    → AudioBufferProcessor (capture bot audio, right channel)
-    → SmallWebRTCTransport.output()
-    → LLMContextAggregator (assistant)
+Supports two transport channels, both  using the same AI stack:
 
-VAD note: WebRtcVadAnalyzer was removed in pipecat 0.0.100+. We now use
-          SileroVADAnalyzer (ONNX-based, no PyTorch/DLL required on Windows).
+  Web Call  (WebRTC):
+    SmallWebRTCTransport  → STT → LLM → TTS → SmallWebRTCTransport
 
-Deepgram keepalive: We set keepalive=True and a short endpointing window so
-          the STT WebSocket never idles out with code 1011.
+  Phone Call (Twilio/Telephony):
+    FastAPIWebsocketTransport → STT → LLM → TTS → FastAPIWebsocketTransport
 
-Recording: AudioBufferProcessor captures both channels then merges them into
-          a stereo WAV (user left, bot right) on pipeline end.
+Both channels:
+  - Use the identical Loan Assistant system prompt (core/prompt.py)
+  - Use the same Deepgram STT/TTS and Groq LLM configuration
+  - Register the same three LLM tools (get_loan_information, search_web, end_call)
+  - Save call records to Aria's unified MongoDB `calls` collection
+    distinguished by source: 'web' | 'phone'
+
+VAD: SileroVADAnalyzer (ONNX, no PyTorch DLL required on Windows)
+Recording: stereo WAV saved to backend/recordings/ (web calls only)
 """
 
 import asyncio
 import struct
+import os
+from datetime import datetime
 
-from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.frames.frames import TTSSpeakFrame, TextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
@@ -33,12 +33,17 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
 )
+from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.websocket.fastapi import (
+    FastAPIWebsocketParams,
+    FastAPIWebsocketTransport,
+)
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 
 from core.config import settings
@@ -238,3 +243,243 @@ def _save_recording(pc_id: str, user_audio: _AudioAccumulator, bot_audio: _Audio
         log.info(f"Recording saved: {path}")
     except Exception as e:
         log.error(f"Failed to save recording for {pc_id}: {e}", exc_info=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHONE CALL PIPELINE  (Twilio Media Streams / Telephony)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _analyze_transcript(transcript: list) -> dict:
+    """
+    Post-call analysis: ask Groq to extract sentiment and interest level
+    from the conversation transcript and return structured JSON.
+    """
+    try:
+        import json
+        from groq import AsyncGroq
+
+        transcript_str = str(transcript)[:10_000]
+        prompt = f"""Analyze this call transcript and respond with a JSON object containing:
+- summary (string): 1-2 sentence summary of the call
+- sentiment (string): positive | neutral | negative
+- is_interested (bool): true if the caller showed genuine interest in a loan
+- key_topics (list of strings): main topics discussed
+
+Transcript:
+{transcript_str}"""
+
+        client = AsyncGroq(api_key=settings.GROQ_API_KEY)
+        completion = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        text = completion.choices[0].message.content.strip()
+        # Strip markdown fences if present
+        if text.startswith("```json"):
+            text = text[7:-3]
+        elif text.startswith("```"):
+            text = text[3:-3]
+        return json.loads(text)
+    except Exception as e:
+        log.error(f"Post-call analysis failed: {e}")
+        return {"error": str(e), "is_interested": False}
+
+
+async def _run_phone_bot(
+    transport: FastAPIWebsocketTransport,
+    stream_sid: str,
+    call_sid: str,
+) -> None:
+    """
+    Core phone-call AI loop.  Runs inside phone_bot() after the transport
+    is configured.  Mirrors create_pipeline() but uses 8 kHz audio rates
+    required by Twilio Media Streams.
+    """
+    from core.db.database import get_database
+    from core.tools.manager import ToolManager
+
+    # ── Services ──────────────────────────────────────────────────────────────
+    stt = DeepgramSTTService(
+        api_key=settings.DEEPGRAM_API_KEY,
+        model=settings.DEEPGRAM_STT_MODEL,
+        language="en-US",
+        live_options=LiveOptions(
+            model=settings.DEEPGRAM_STT_MODEL,
+            language="en-US",
+            encoding="mulaw",       # Twilio uses mulaw 8-bit
+            sample_rate=8000,
+            channels=1,
+            endpointing=300,
+            interim_results=True,
+            smart_format=True,
+            utterance_end_ms="1000",
+        ),
+        keepalive=True,
+    )
+
+    llm = GroqLLMService(
+        api_key=settings.GROQ_API_KEY,
+        model=settings.GROQ_MODEL,
+    )
+
+    tts = DeepgramTTSService(
+        api_key=settings.DEEPGRAM_API_KEY,
+        voice=settings.DEEPGRAM_TTS_MODEL,
+        sample_rate=8000,           # Match Twilio's 8 kHz output
+    )
+
+    # ── Context ───────────────────────────────────────────────────────────────
+    context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
+    context_aggregator = LLMContextAggregatorPair(context)
+
+    # ── Pipeline ──────────────────────────────────────────────────────────────
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            context_aggregator.user(),
+            llm,
+            tts,
+            transport.output(),
+            context_aggregator.assistant(),
+        ]
+    )
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            allow_interruptions=True,
+            enable_metrics=True,
+            enable_usage_metrics=True,
+            audio_in_sample_rate=8000,
+            audio_out_sample_rate=8000,
+        ),
+    )
+
+    # ── Tools ─────────────────────────────────────────────────────────────────
+    tool_manager = ToolManager(task=task, call_sid=call_sid, source="phone")
+    for fn in (
+        tool_manager.get_loan_information,
+        tool_manager.search_web,
+        tool_manager.end_call,
+    ):
+        llm.register_direct_function(fn)
+        log.info(f"✅ Registered tool: {fn.__name__}")
+
+    runner = PipelineRunner(handle_sigint=False)
+
+    # ── Greeting ──────────────────────────────────────────────────────────────
+    @transport.event_handler("on_client_connected")
+    async def on_connected(transport, client):
+        log.info("📞 Phone call connected — sending greeting")
+        try:
+            await asyncio.sleep(1.0)   # brief pause before greeting
+            await task.queue_frames(
+                [TextFrame(text="Hello! I'm Aria, your loan assistant. How can I help you today?")]
+            )
+        except Exception as e:
+            log.error(f"Greeting failed: {e}", exc_info=True)
+
+    # ── Save call start record ─────────────────────────────────────────────────
+    db = None
+    try:
+        db = get_database()
+        await db["calls"].insert_one(
+            {
+                "source": "phone",
+                "call_sid": call_sid,
+                "stream_sid": stream_sid,
+                "status": "started",
+                "start_time": datetime.utcnow(),
+            }
+        )
+        log.info(f"📝 Call record created for call_sid={call_sid}")
+    except Exception as e:
+        log.error(f"Failed to insert call start record: {e}")
+
+    # ── Run ───────────────────────────────────────────────────────────────────
+    try:
+        log.info(f"▶️  Running phone pipeline for call_sid={call_sid}")
+        await runner.run(task)
+    except Exception as e:
+        log.error(f"❌ Phone pipeline error: {e}", exc_info=True)
+
+    # ── Post-call: save transcript + analysis ─────────────────────────────────
+    def _serialize(obj):
+        if isinstance(obj, dict):
+            return {k: _serialize(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_serialize(i) for i in obj]
+        elif hasattr(obj, "isoformat"):
+            return obj.isoformat()
+        elif hasattr(obj, "__dict__"):
+            return _serialize(obj.__dict__)
+        elif isinstance(obj, (str, int, float, bool, type(None))):
+            return obj
+        return str(obj)
+
+    transcript = [_serialize(m) for m in context.messages]
+    log.info("📊 Analyzing phone call transcript...")
+    analysis = await _analyze_transcript(transcript)
+    log.info(f"Analysis: {analysis}")
+
+    if db is not None:
+        try:
+            await db["calls"].update_one(
+                {"call_sid": call_sid},
+                {
+                    "$set": {
+                        "status": "completed",
+                        "end_time": datetime.utcnow(),
+                        "transcript": transcript,
+                        "analysis": analysis,
+                    }
+                },
+            )
+
+            if analysis.get("is_interested"):
+                log.info("💰 Interested lead detected — saving to loan_interests")
+                await db["loan_interests"].insert_one(
+                    {
+                        "source": "phone",
+                        "call_sid": call_sid,
+                        "analysis": analysis,
+                        "timestamp": datetime.utcnow(),
+                    }
+                )
+        except Exception as e:
+            log.error(f"Failed to update call record: {e}")
+
+
+async def phone_bot(websocket, stream_sid: str, call_sid: str) -> None:
+    """
+    Entry point for an inbound Twilio Media Streams WebSocket connection.
+
+    Configures FastAPIWebsocketTransport with TwilioFrameSerializer
+    (handles mulaw encode/decode + Twilio message framing), then delegates
+    to the AI pipeline loop in _run_phone_bot().
+
+    Called from the telephony router in core/apis/telephony.py.
+    """
+    try:
+        serializer = TwilioFrameSerializer(
+            stream_sid=stream_sid,
+            call_sid=call_sid,
+            account_sid=settings.TWILIO_ACCOUNT_SID,
+            auth_token=settings.TWILIO_AUTH_TOKEN,
+        )
+
+        transport = FastAPIWebsocketTransport(
+            websocket=websocket,
+            params=FastAPIWebsocketParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+                add_wav_header=False,
+                serializer=serializer,
+            ),
+        )
+
+        await _run_phone_bot(transport, stream_sid, call_sid)
+    except Exception as e:
+        log.error(f"❌ phone_bot error: {e}", exc_info=True)

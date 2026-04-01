@@ -118,3 +118,53 @@ A directive, concise system prompt ensures:
 - Responses are short and conversational for voice.
 - The bot can handle both voice and text input identically.
 - No hallucination — tool usage enforced for factual queries.
+
+---
+
+## 5. Telephony Integration (Phase 4 — Migration from Voice_AI)
+
+### 5.1 Context
+Aria was originally web-only (WebRTC). Voice_AI held an independent Twilio telephony pipeline.
+These were merged into Aria so that both channels share one codebase, one persona, and one DB.
+
+### 5.2 Telephony Architecture
+
+```
+Twilio Cloud ──[Media Streams WebSocket]──► POST /api/telephony/ws  (FastAPI WebSocket)
+                                                     │
+                                         FastAPIWebsocketTransport
+                                         + TwilioFrameSerializer
+                                                     │
+                                         Pipecat AI Pipeline
+                              (STT→LLM→TTS, identical to web pipeline)
+                                                     │
+                                          MongoDB `calls` collection
+                                          source: "phone"
+```
+
+### 5.3 New Endpoints
+
+| Method   | Path                         | Purpose                                  |
+|----------|------------------------------|------------------------------------------|
+| POST     | /api/telephony/dialout       | Initiate outbound Twilio call            |
+| POST     | /api/telephony/twiml         | Return TwiML (Twilio webhook)            |
+| WS       | /api/telephony/ws            | Twilio Media Streams WebSocket            |
+| GET      | /api/telephony/calls         | Unified call history (web + phone)       |
+| POST     | /api/telephony/submit-lead   | Save a lead form                         |
+
+### 5.4 Single AI Pipeline — Dual Transport
+`core/pipeline.py` exports:
+- `create_pipeline(webrtc_connection)` → WebRTC (web calls)
+- `phone_bot(websocket, stream_sid, call_sid)` → Twilio (phone calls)
+
+Both use identical STT/LLM/TTS config and the same system prompt.
+The only difference is transport params (`8 kHz mulaw` for Twilio vs `16 kHz PCM16` for WebRTC).
+
+### 5.5 Unified Database
+Both channels write to `aria_db.calls` with a `source` field ('web' | 'phone').
+Post-call analysis (sentiment, interest, summary) is run by Groq after every phone call.
+
+### 5.6 Frontend Changes
+Sidebar gained two new tabs:
+- **Phone**: Outbound dialer UI → calls `/api/telephony/dialout`
+- **History**: Unified call list with source badge, status, duration, expandable analysis

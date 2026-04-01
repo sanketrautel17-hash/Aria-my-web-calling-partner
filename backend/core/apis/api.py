@@ -26,16 +26,24 @@ from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 
 from core.pipeline import create_pipeline
 from core.recordings import get_recordings_dir, list_recordings
+from core.db.database import connect_to_mongo, close_mongo_connection
+from core.apis.telephony import router as telephony_router
 from commons.logger import logger
 
 log = logger(__name__)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Aria — Voice & Chat AI Agent",
-    description="Real-time voice and text AI agent powered by Pipecat, Deepgram, and Groq.",
-    version="1.0.0",
+    title="Aria — Voice & Telephony AI Agent",
+    description=(
+        "Real-time AI agent for web (WebRTC) and phone (Twilio) calls. "
+        "Powered by Pipecat, Deepgram STT/TTS, and Groq LLM."
+    ),
+    version="2.0.0",
 )
+
+# ── Mount routers ─────────────────────────────────────────────────────────────
+app.include_router(telephony_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -235,11 +243,18 @@ async def webrtc_ice_candidates(request: Request):
     return {"status": "ok"}
 
 
+@app.on_event("startup")
+async def startup():
+    """Connect to MongoDB on app startup."""
+    await connect_to_mongo()
+
+
 @app.on_event("shutdown")
 async def shutdown():
-    """Clean up all active WebRTC connections on server shutdown."""
+    """Clean up all active WebRTC connections and DB on server shutdown."""
     log.info("Server shutting down — closing all WebRTC connections")
     await _handler.close()
+    await close_mongo_connection()
 
 
 # ── Recordings ────────────────────────────────────────────────────────────────
